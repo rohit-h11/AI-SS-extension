@@ -8,38 +8,71 @@
   });
   const copy = blob => navigator.clipboard.write([new ClipboardItem({"image/png": blob})]);
 
-  async function frame(streamId) {
-    let stream, timer, expired = false;
+  async function frame(streamId, onSourceReady) {
+    let stream, video, expired = false;
+    const bounded = async (operation, ms, message) => {
+      let timer;
+      try {
+        return await Promise.race([operation, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), ms);
+        })]);
+      } finally { clearTimeout(timer); }
+    };
     const stop = () => { stream?.getTracks().forEach(t => t.stop()); };
     const onHide = () => { expired = true; stop(); };
     window.addEventListener("pagehide", onHide);
-    const video = document.createElement("video");
-    video.muted = true;
     try {
       const media = navigator.mediaDevices.getUserMedia({audio: false, video: {mandatory: {
         chromeMediaSource: "desktop", chromeMediaSourceId: streamId, maxWidth: 16384, maxHeight: 16384
       }}});
       // Even a stream resolving after timeout/navigation must release every track.
       media.then(s => { if (expired) s.getTracks().forEach(t => t.stop()); }, () => {});
-      stream = await Promise.race([media, new Promise((_, reject) => {
-        timer = setTimeout(() => { expired = true; reject(new Error("Screen capture timed out.")); }, 15000);
-      })]);
-      clearTimeout(timer);
+      try { stream = await bounded(media, 15000, "Screen capture timed out."); }
+      catch (e) { expired = true; throw e; }
       if (expired) throw new Error("Capture cancelled by navigation.");
-      video.srcObject = stream;
-      await Promise.race([(async () => {
-        await video.play();
-        await new Promise(resolve => video.requestVideoFrameCallback(resolve));
-      })(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("No video frame received.")), 10000); })]);
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-      if (!canvas.width || !canvas.height) throw new Error("The source has no visible frame.");
-      canvas.getContext("2d").drawImage(video, 0, 0);
-      return canvas;
+      const track = stream.getVideoTracks()[0];
+      if (!track) throw new Error("The selected source has no video track.");
+      // Tab capture stays valid when the captured tab is in the background. Return
+      // to the chat now; for screen/window sources wait until the frame is frozen.
+      if (track.getSettings().displaySurface === "browser") await onSourceReady();
+      const draw = (image, width, height) => {
+        if (!width || !height) throw new Error("The source has no visible frame.");
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(image, 0, 0);
+        return canvas;
+      };
+      if (typeof ImageCapture === "function") {
+        let bitmap, abandoned = false;
+        try {
+          // Grab directly from the track. A hidden/detached video's compositor
+          // callback may never run while Chrome has focused the selected tab.
+          const pending = new ImageCapture(track).grabFrame();
+          pending.then(value => { if (abandoned) value.close(); }, () => {});
+          bitmap = await bounded(pending, 4000, "Direct frame capture timed out.");
+          return draw(bitmap, bitmap.width, bitmap.height);
+        } catch (e) {
+          console.debug("ShotToAI: using decoded-video fallback:", e.message);
+        } finally { abandoned = true; bitmap?.close(); }
+      }
+      // Fallback waits for decoded data, not a compositor/animation callback.
+      video = document.createElement("video");
+      video.muted = true; video.playsInline = true; video.srcObject = stream;
+      let decoding = true;
+      try {
+        await bounded((async () => {
+          await video.play();
+          while (decoding && !expired && (video.readyState < 2 || !video.videoWidth || !video.videoHeight)) {
+            if (video.error || track.readyState === "ended") throw new Error("Screen capture ended before a frame arrived.");
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          if (!decoding || expired) throw new Error("Frame capture cancelled.");
+        })(), 5000, "No decoded screenshot frame received.");
+        return draw(video, video.videoWidth, video.videoHeight);
+      } finally { decoding = false; }
     } finally {
-      clearTimeout(timer);
       stop(); // Release capture BEFORE displaying an overlay or encoding/uploading.
-      video.srcObject = null;
+      if (video) { video.pause(); video.srcObject = null; }
       window.removeEventListener("pagehide", onHide);
     }
   }
@@ -136,9 +169,12 @@
       checkLocation();
       document.getElementById("shottoai-toast")?.remove();
       document.getElementById("shottoai-panel")?.remove();
-      const original = await frame(streamId);
-      // Chrome may focus the selected source. Restore the same chat after the frame is frozen.
-      await request("SHOT_FOCUS");
+      let original;
+      try { original = await frame(streamId, () => request("SHOT_FOCUS")); }
+      finally {
+        // Also return to the chat on capture failure, after releasing all tracks.
+        await request("SHOT_FOCUS").catch(() => {});
+      }
       const result = settings.crop ? await cropPreview(original) : {crop: null};
       if (result.cancelled) { toast("Screenshot capture cancelled."); return {cancelled: true}; }
       const r = result.crop || {x: 0, y: 0, w: original.width, h: original.height};

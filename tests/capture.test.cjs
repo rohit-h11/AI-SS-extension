@@ -4,9 +4,12 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function harness({playError = false} = {}) {
+function harness({playError = false, imageCapture = 'success', surface = 'browser', shortTimeouts = false} = {}) {
   const nodes = [], events = [], intervals = new Set();
   let stopped = 0, attached = 0;
+  let resolveBitmap;
+  const track = {readyState: 'live', getSettings: () => ({displaySurface: surface}),
+    stop() {stopped++; events.push(['stop']);}};
   const location = {href: 'https://chatgpt.com/c/test'};
   const create = tag => {
     const node = {tag, style: {}, children: [], width: 0, height: 0,
@@ -17,8 +20,9 @@ function harness({playError = false} = {}) {
       getContext() {return {drawImage() {}, fillRect() {}, strokeRect() {}};},
       toBlob(cb) {events.push(['encode', this.width, this.height]); cb(new Blob(['png'], {type: 'image/png'}));}
     };
-    if (tag === 'video') Object.assign(node, {videoWidth: 3840, videoHeight: 2160,
-      play: async () => {if (playError) throw Error('frame failed');}, requestVideoFrameCallback: f => queueMicrotask(f)});
+    if (tag === 'video') Object.assign(node, {videoWidth: 3840, videoHeight: 2160, readyState: 2,
+      play: async () => {if (playError) throw Error('frame failed');}, pause() {},
+      requestVideoFrameCallback() {throw Error('Must not wait for a hidden video compositor callback');}});
     nodes.push(node); return node;
   };
   const context = vm.createContext({
@@ -27,14 +31,24 @@ function harness({playError = false} = {}) {
     document: {getElementById: id => nodes.find(n => n.id === id && !n.removed), createElement: create, documentElement: create('root')},
     navigator: {mediaDevices: {getUserMedia: async args => {
       events.push(['media', args]);
-      return {getTracks: () => [{stop() {stopped++; events.push(['stop']);}}]};
+      return {getTracks: () => [track], getVideoTracks: () => [track]};
     }}, clipboard: {write: async () => events.push(['copy'])}},
     ClipboardItem: class {},
     FileReader: class {readAsDataURL() {this.result = 'data:image/png;base64,cG5n'; queueMicrotask(() => this.onload());}},
     chrome: {runtime: {sendMessage: async m => {events.push(['message', m.type]); return {ok: true};}}},
-    setTimeout, clearTimeout,
+    setTimeout: (f, ms) => setTimeout(f, shortTimeouts && ms >= 4000 ? 10 : ms), clearTimeout,
     setInterval: f => {intervals.add(f); return f;}, clearInterval: f => intervals.delete(f)
   });
+  if (imageCapture !== 'absent') context.ImageCapture = class {
+    constructor(input) {assert.equal(input, track);}
+    async grabFrame() {
+      events.push(['grabFrame']);
+      if (imageCapture === 'reject') throw Error('ImageCapture unsupported on this track');
+      const bitmap = {width: 3840, height: 2160, close() {events.push(['bitmapClosed']);}};
+      if (imageCapture === 'pending') return new Promise(resolve => {resolveBitmap = () => resolve(bitmap);});
+      return bitmap;
+    }
+  };
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../shottoai/page-capture.js'), 'utf8'), context);
   const run = (settings = {}) => context.__shotCapture({streamId: 'token', jobId: 'job-12345678', targetUrl: 'https://chatgpt.com/c/test',
     settings: {crop: false, copy: false, save: false, maxWidth: 1920, ...settings}}, async () => {
@@ -46,7 +60,8 @@ function harness({playError = false} = {}) {
     for (let i = 0; i < 20; i++) { if (button(label)) return button(label); await new Promise(setImmediate); }
     throw Error('Missing button: ' + label);
   };
-  return {run, nodes, events, intervals, location, button, waitButton, stopped: () => stopped, attached: () => attached};
+  return {run, nodes, events, intervals, location, button, waitButton, stopped: () => stopped, attached: () => attached,
+    resolveBitmap: () => resolveBitmap()};
 }
 test('page capture stops media before encoding, downscales and attaches without any new page', async () => {
   const h = harness();
@@ -88,15 +103,41 @@ test('navigation during crop refuses attachment and offers copy on the same page
   assert.equal(h.intervals.size, 0);
 });
 test('video failure still stops tracks and clears heartbeat', async () => {
-  const h = harness({playError: true});
+  const h = harness({playError: true, imageCapture: 'reject'});
   await assert.rejects(h.run(), /frame failed/);
   assert.equal(h.stopped(), 1);
   assert.equal(h.attached(), 0);
   assert.equal(h.intervals.size, 0);
+  assert.equal(h.events.at(-1)[1], 'SHOT_FOCUS');
 });
 test('clipboard and download options work in the page capture path', async () => {
   const h = harness(); await h.run({copy: true, save: true});
   assert.ok(h.events.some(e => e[0] === 'copy'));
   assert.ok(h.events.some(e => e[0] === 'message' && e[1] === 'SHOT_SAVE'));
   assert.equal(h.attached(), 1);
+});
+test('tab capture restores chat before grabbing directly without creating a video element', async () => {
+  const h = harness(); await h.run();
+  assert.equal(h.nodes.some(n => n.tag === 'video'), false);
+  const focus = h.events.findIndex(e => e[0] === 'message' && e[1] === 'SHOT_FOCUS');
+  assert.ok(focus < h.events.findIndex(e => e[0] === 'grabFrame'));
+  assert.equal(h.events.filter(e => e[0] === 'bitmapClosed').length, 1);
+});
+for (const surface of ['window', 'monitor']) test(surface + ' capture freezes source before restoring chat focus', async () => {
+  const h = harness({surface}); await h.run();
+  const focus = h.events.findIndex(e => e[0] === 'message' && e[1] === 'SHOT_FOCUS');
+  assert.ok(focus > h.events.findIndex(e => e[0] === 'stop'));
+});
+for (const imageCapture of ['absent', 'reject']) test('decoded-video fallback works without rendering callbacks when ImageCapture is ' + imageCapture, async () => {
+  const h = harness({imageCapture}); await h.run();
+  assert.equal(h.attached(), 1);
+  assert.equal(h.stopped(), 1);
+  assert.ok(h.nodes.some(n => n.tag === 'video'));
+});
+test('hung grabFrame falls back, stops sharing, and closes late bitmap', async () => {
+  const h = harness({imageCapture: 'pending', shortTimeouts: true}); await h.run();
+  assert.equal(h.stopped(), 1);
+  assert.equal(h.attached(), 1);
+  h.resolveBitmap(); await new Promise(setImmediate);
+  assert.equal(h.events.filter(e => e[0] === 'bitmapClosed').length, 1);
 });

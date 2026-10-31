@@ -1,4 +1,4 @@
-# ShotToAI 1.1 — complete source
+# ShotToAI 1.1.1 — complete source
 
 ## shottoai/manifest.json
 
@@ -6,7 +6,7 @@
 {
   "manifest_version": 3,
   "name": "ShotToAI",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Capture a tab, window, or screen and attach a PNG to your AI chat without sending it.",
   "minimum_chrome_version": "116",
   "permissions": ["desktopCapture", "scripting", "tabs", "storage", "clipboardWrite"],
@@ -384,38 +384,71 @@ export function pngData(blob) {
   });
   const copy = blob => navigator.clipboard.write([new ClipboardItem({"image/png": blob})]);
 
-  async function frame(streamId) {
-    let stream, timer, expired = false;
+  async function frame(streamId, onSourceReady) {
+    let stream, video, expired = false;
+    const bounded = async (operation, ms, message) => {
+      let timer;
+      try {
+        return await Promise.race([operation, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), ms);
+        })]);
+      } finally { clearTimeout(timer); }
+    };
     const stop = () => { stream?.getTracks().forEach(t => t.stop()); };
     const onHide = () => { expired = true; stop(); };
     window.addEventListener("pagehide", onHide);
-    const video = document.createElement("video");
-    video.muted = true;
     try {
       const media = navigator.mediaDevices.getUserMedia({audio: false, video: {mandatory: {
         chromeMediaSource: "desktop", chromeMediaSourceId: streamId, maxWidth: 16384, maxHeight: 16384
       }}});
       // Even a stream resolving after timeout/navigation must release every track.
       media.then(s => { if (expired) s.getTracks().forEach(t => t.stop()); }, () => {});
-      stream = await Promise.race([media, new Promise((_, reject) => {
-        timer = setTimeout(() => { expired = true; reject(new Error("Screen capture timed out.")); }, 15000);
-      })]);
-      clearTimeout(timer);
+      try { stream = await bounded(media, 15000, "Screen capture timed out."); }
+      catch (e) { expired = true; throw e; }
       if (expired) throw new Error("Capture cancelled by navigation.");
-      video.srcObject = stream;
-      await Promise.race([(async () => {
-        await video.play();
-        await new Promise(resolve => video.requestVideoFrameCallback(resolve));
-      })(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("No video frame received.")), 10000); })]);
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-      if (!canvas.width || !canvas.height) throw new Error("The source has no visible frame.");
-      canvas.getContext("2d").drawImage(video, 0, 0);
-      return canvas;
+      const track = stream.getVideoTracks()[0];
+      if (!track) throw new Error("The selected source has no video track.");
+      // Tab capture stays valid when the captured tab is in the background. Return
+      // to the chat now; for screen/window sources wait until the frame is frozen.
+      if (track.getSettings().displaySurface === "browser") await onSourceReady();
+      const draw = (image, width, height) => {
+        if (!width || !height) throw new Error("The source has no visible frame.");
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(image, 0, 0);
+        return canvas;
+      };
+      if (typeof ImageCapture === "function") {
+        let bitmap, abandoned = false;
+        try {
+          // Grab directly from the track. A hidden/detached video's compositor
+          // callback may never run while Chrome has focused the selected tab.
+          const pending = new ImageCapture(track).grabFrame();
+          pending.then(value => { if (abandoned) value.close(); }, () => {});
+          bitmap = await bounded(pending, 4000, "Direct frame capture timed out.");
+          return draw(bitmap, bitmap.width, bitmap.height);
+        } catch (e) {
+          console.debug("ShotToAI: using decoded-video fallback:", e.message);
+        } finally { abandoned = true; bitmap?.close(); }
+      }
+      // Fallback waits for decoded data, not a compositor/animation callback.
+      video = document.createElement("video");
+      video.muted = true; video.playsInline = true; video.srcObject = stream;
+      let decoding = true;
+      try {
+        await bounded((async () => {
+          await video.play();
+          while (decoding && !expired && (video.readyState < 2 || !video.videoWidth || !video.videoHeight)) {
+            if (video.error || track.readyState === "ended") throw new Error("Screen capture ended before a frame arrived.");
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          if (!decoding || expired) throw new Error("Frame capture cancelled.");
+        })(), 5000, "No decoded screenshot frame received.");
+        return draw(video, video.videoWidth, video.videoHeight);
+      } finally { decoding = false; }
     } finally {
-      clearTimeout(timer);
       stop(); // Release capture BEFORE displaying an overlay or encoding/uploading.
-      video.srcObject = null;
+      if (video) { video.pause(); video.srcObject = null; }
       window.removeEventListener("pagehide", onHide);
     }
   }
@@ -512,9 +545,12 @@ export function pngData(blob) {
       checkLocation();
       document.getElementById("shottoai-toast")?.remove();
       document.getElementById("shottoai-panel")?.remove();
-      const original = await frame(streamId);
-      // Chrome may focus the selected source. Restore the same chat after the frame is frozen.
-      await request("SHOT_FOCUS");
+      let original;
+      try { original = await frame(streamId, () => request("SHOT_FOCUS")); }
+      finally {
+        // Also return to the chat on capture failure, after releasing all tracks.
+        await request("SHOT_FOCUS").catch(() => {});
+      }
       const result = settings.crop ? await cropPreview(original) : {crop: null};
       if (result.cancelled) { toast("Screenshot capture cancelled."); return {cancelled: true}; }
       const r = result.crop || {x: 0, y: 0, w: original.width, h: original.height};
@@ -847,9 +883,12 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function harness({playError = false} = {}) {
+function harness({playError = false, imageCapture = 'success', surface = 'browser', shortTimeouts = false} = {}) {
   const nodes = [], events = [], intervals = new Set();
   let stopped = 0, attached = 0;
+  let resolveBitmap;
+  const track = {readyState: 'live', getSettings: () => ({displaySurface: surface}),
+    stop() {stopped++; events.push(['stop']);}};
   const location = {href: 'https://chatgpt.com/c/test'};
   const create = tag => {
     const node = {tag, style: {}, children: [], width: 0, height: 0,
@@ -860,8 +899,9 @@ function harness({playError = false} = {}) {
       getContext() {return {drawImage() {}, fillRect() {}, strokeRect() {}};},
       toBlob(cb) {events.push(['encode', this.width, this.height]); cb(new Blob(['png'], {type: 'image/png'}));}
     };
-    if (tag === 'video') Object.assign(node, {videoWidth: 3840, videoHeight: 2160,
-      play: async () => {if (playError) throw Error('frame failed');}, requestVideoFrameCallback: f => queueMicrotask(f)});
+    if (tag === 'video') Object.assign(node, {videoWidth: 3840, videoHeight: 2160, readyState: 2,
+      play: async () => {if (playError) throw Error('frame failed');}, pause() {},
+      requestVideoFrameCallback() {throw Error('Must not wait for a hidden video compositor callback');}});
     nodes.push(node); return node;
   };
   const context = vm.createContext({
@@ -870,14 +910,24 @@ function harness({playError = false} = {}) {
     document: {getElementById: id => nodes.find(n => n.id === id && !n.removed), createElement: create, documentElement: create('root')},
     navigator: {mediaDevices: {getUserMedia: async args => {
       events.push(['media', args]);
-      return {getTracks: () => [{stop() {stopped++; events.push(['stop']);}}]};
+      return {getTracks: () => [track], getVideoTracks: () => [track]};
     }}, clipboard: {write: async () => events.push(['copy'])}},
     ClipboardItem: class {},
     FileReader: class {readAsDataURL() {this.result = 'data:image/png;base64,cG5n'; queueMicrotask(() => this.onload());}},
     chrome: {runtime: {sendMessage: async m => {events.push(['message', m.type]); return {ok: true};}}},
-    setTimeout, clearTimeout,
+    setTimeout: (f, ms) => setTimeout(f, shortTimeouts && ms >= 4000 ? 10 : ms), clearTimeout,
     setInterval: f => {intervals.add(f); return f;}, clearInterval: f => intervals.delete(f)
   });
+  if (imageCapture !== 'absent') context.ImageCapture = class {
+    constructor(input) {assert.equal(input, track);}
+    async grabFrame() {
+      events.push(['grabFrame']);
+      if (imageCapture === 'reject') throw Error('ImageCapture unsupported on this track');
+      const bitmap = {width: 3840, height: 2160, close() {events.push(['bitmapClosed']);}};
+      if (imageCapture === 'pending') return new Promise(resolve => {resolveBitmap = () => resolve(bitmap);});
+      return bitmap;
+    }
+  };
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../shottoai/page-capture.js'), 'utf8'), context);
   const run = (settings = {}) => context.__shotCapture({streamId: 'token', jobId: 'job-12345678', targetUrl: 'https://chatgpt.com/c/test',
     settings: {crop: false, copy: false, save: false, maxWidth: 1920, ...settings}}, async () => {
@@ -889,7 +939,8 @@ function harness({playError = false} = {}) {
     for (let i = 0; i < 20; i++) { if (button(label)) return button(label); await new Promise(setImmediate); }
     throw Error('Missing button: ' + label);
   };
-  return {run, nodes, events, intervals, location, button, waitButton, stopped: () => stopped, attached: () => attached};
+  return {run, nodes, events, intervals, location, button, waitButton, stopped: () => stopped, attached: () => attached,
+    resolveBitmap: () => resolveBitmap()};
 }
 test('page capture stops media before encoding, downscales and attaches without any new page', async () => {
   const h = harness();
@@ -931,17 +982,43 @@ test('navigation during crop refuses attachment and offers copy on the same page
   assert.equal(h.intervals.size, 0);
 });
 test('video failure still stops tracks and clears heartbeat', async () => {
-  const h = harness({playError: true});
+  const h = harness({playError: true, imageCapture: 'reject'});
   await assert.rejects(h.run(), /frame failed/);
   assert.equal(h.stopped(), 1);
   assert.equal(h.attached(), 0);
   assert.equal(h.intervals.size, 0);
+  assert.equal(h.events.at(-1)[1], 'SHOT_FOCUS');
 });
 test('clipboard and download options work in the page capture path', async () => {
   const h = harness(); await h.run({copy: true, save: true});
   assert.ok(h.events.some(e => e[0] === 'copy'));
   assert.ok(h.events.some(e => e[0] === 'message' && e[1] === 'SHOT_SAVE'));
   assert.equal(h.attached(), 1);
+});
+test('tab capture restores chat before grabbing directly without creating a video element', async () => {
+  const h = harness(); await h.run();
+  assert.equal(h.nodes.some(n => n.tag === 'video'), false);
+  const focus = h.events.findIndex(e => e[0] === 'message' && e[1] === 'SHOT_FOCUS');
+  assert.ok(focus < h.events.findIndex(e => e[0] === 'grabFrame'));
+  assert.equal(h.events.filter(e => e[0] === 'bitmapClosed').length, 1);
+});
+for (const surface of ['window', 'monitor']) test(surface + ' capture freezes source before restoring chat focus', async () => {
+  const h = harness({surface}); await h.run();
+  const focus = h.events.findIndex(e => e[0] === 'message' && e[1] === 'SHOT_FOCUS');
+  assert.ok(focus > h.events.findIndex(e => e[0] === 'stop'));
+});
+for (const imageCapture of ['absent', 'reject']) test('decoded-video fallback works without rendering callbacks when ImageCapture is ' + imageCapture, async () => {
+  const h = harness({imageCapture}); await h.run();
+  assert.equal(h.attached(), 1);
+  assert.equal(h.stopped(), 1);
+  assert.ok(h.nodes.some(n => n.tag === 'video'));
+});
+test('hung grabFrame falls back, stops sharing, and closes late bitmap', async () => {
+  const h = harness({imageCapture: 'pending', shortTimeouts: true}); await h.run();
+  assert.equal(h.stopped(), 1);
+  assert.equal(h.attached(), 1);
+  h.resolveBitmap(); await new Promise(setImmediate);
+  assert.equal(h.events.filter(e => e[0] === 'bitmapClosed').length, 1);
 });
 ```
 
