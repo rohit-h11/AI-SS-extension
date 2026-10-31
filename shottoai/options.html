@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ShotToAI options</title><link rel="stylesheet" href="style.css"></head>
+<body><main class="options">
+<h1>ShotToAI options</h1><p>Capture once. Attach to your chat. Send when you are ready.</p>
+<form id="options">
+  <label>Default AI site<select id="defaultSite"><option value="chatgpt.com">ChatGPT</option><option value="claude.ai">Claude</option><option value="gemini.google.com">Gemini</option></select></label>
+  <label>Maximum image width (pixels)<input id="maxWidth" type="number" min="320" max="7680" step="1" required></label>
+  <label class="check"><input type="checkbox" id="copy"> Copy to clipboard as well</label>
+  <label class="check"><input type="checkbox" id="save"> Also save a PNG to Downloads/ShotToAI</label>
+  <label class="check"><input type="checkbox" id="crop"> Preview and crop before attaching</label>
+  <button type="submit">Save options</button>
+</form>
+<p id="status" role="status" aria-live="polite"></p>
+<button id="shortcuts" class="secondary">Configure keyboard shortcut</button>
+<p>The default is Ctrl+Shift+S, including Control on Mac. Change conflicts in Chrome.</p>
+<p>No ShotToAI servers or analytics. Your AI website may upload an attachment immediately, before you send the message.</p>
+</main><script type="module" src="options.js"></script></body></html>
